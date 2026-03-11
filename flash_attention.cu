@@ -1,138 +1,174 @@
-import torch
-from torch.utils.cpp_extension import load
-import os
-
-
-cuda_code = """
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <math.h>
 #include <float.h>
 
-__global__ void flash_attn_v2_fwd_kernel(
-    const float* Q, const float* K, const float* V,
-    float* O, float* L,
-    int N, int d, int Br, int Bc, float softmax_scale
+// Section 1: Unparallelized C Implementation
+// This follows Algorithm 1 logic for CPU-based verification
+void flash_attn_cpu(float* Q, float* K, float* V, float* O, int N, int d, int Br, int Bc) {
+    float scale = 1.0f / sqrtf((float)d);
+    int Tr = N / Br;
+    int Tc = N / Bc;
+
+    for (int i = 0; i < Tr; i++) {
+        float* Qi = &Q[i * Br * d];
+        float* Oi = &O[i * Br * d];
+        float mi[1024], li[1024]; 
+
+        for (int r = 0; r < Br; r++) {
+            mi[r] = -FLT_MAX;
+            li[r] = 0.0f;
+            for (int x = 0; x < d; x++) Oi[r * d + x] = 0.0f;
+        }
+
+        for (int j = 0; j < Tc; j++) {
+            float* Kj = &K[j * Bc * d];
+            float* Vj = &V[j * Bc * d];
+            
+            for (int r = 0; r < Br; r++) {
+                float row_s[1024]; 
+                float mij = -FLT_MAX;
+                // Line 8: Compute Sij = Qi * Kj^T
+                for (int c = 0; c < Bc; c++) {
+                    float sum = 0;
+                    for (int x = 0; x < d; x++) sum += Qi[r * d + x] * Kj[c * d + x];
+                    row_s[c] = sum * scale;
+                    if (row_s[c] > mij) mij = row_s[c];
+                }
+
+                // Line 9: Update Softmax statistics
+                float mi_new = fmaxf(mi[r], mij);
+                float alpha = expf(mi[r] - mi_new);
+                float lij = 0.0f;
+                for (int c = 0; c < Bc; c++) {
+                    float p = expf(row_s[c] - mi_new);
+                    row_s[c] = p; // P_ij_hat
+                    lij += p;
+                }
+
+                // Line 10: Update Output Chunk
+                for (int x = 0; x < d; x++) {
+                    float pv = 0;
+                    for (int c = 0; c < Bc; c++) pv += row_s[c] * Vj[c * d + x];
+                    Oi[r * d + x] = alpha * Oi[r * d + x] + pv;
+                }
+                li[r] = alpha * li[r] + lij;
+                mi[r] = mi_new;
+            }
+        }
+        // Line 12: Final normalization
+        for (int r = 0; r < Br; r++) {
+            for (int x = 0; x < d; x++) Oi[r * d + x] /= li[r];
+        }
+    }
+}
+
+// Section 2: Parallelized CUDA Implementation
+// Implements Algorithm 1 with IO-awareness and Shared Memory Tiling
+__global__ void flash_attn_v2_kernel(
+    const float* Q, const float* K, const float* V, float* O,
+    int N, int d, int Br, int Bc, float scale
 ) {
     int i = blockIdx.x; 
     int tx = threadIdx.x; 
 
+    // Dynamic Shared Memory Allocation (SharedMem struct equivalent)
     extern __shared__ float sram[];
-    float* qi = sram;                             
-    float* kj = &qi[Br * d];                      
-    float* vj = &kj[Bc * d];                      
-    float* Sij = &vj[Bc * d];                     
+    float* qi = sram;                          // Size: Br * d
+    float* kj = &qi[Br * d];                   // Size: Bc * d
+    float* vj = &kj[Bc * d];                   // Size: Bc * d
+    float* Sij = &vj[Bc * d];                  // Size: Br * Bc
 
+    // Local registers for online softmax
     float mi = -FLT_MAX;
     float li = 0.0f;
-    float oi[128]; // 支持到 d=128
-    for(int k=0; k<d; k++) oi[k] = 0.0f;
+    
+    // Accumulator for output row (Assumes max d=128 for register safety)
+    float local_oi[128]; 
+    for(int n=0; n<d; n++) local_oi[n] = 0.0f;
 
-    for(int k=tx; k<d; k+=Br) {
-        qi[tx * d + k] = Q[(i * Br + tx) * d + k];
+    // Load Qi tile to Shared Memory (stays for all j)
+    for (int n = 0; n < d; n++) {
+        qi[tx * d + n] = Q[(i * Br + tx) * d + n];
     }
     __syncthreads();
 
-    int Tc = (N + Bc - 1) / Bc;
+    int Tc = N / Bc;
     for (int j = 0; j < Tc; j++) {
-        for(int k=tx; k<d; k+=Br) {
-            kj[tx * d + k] = K[(j * Bc + tx) * d + k];
-            vj[tx * d + k] = V[(j * Bc + tx) * d + k];
+        // Collaborative load of Kj and Vj tiles
+        for (int n = 0; n < (Bc * d + Br - 1) / Br; n++) {
+            int idx = n * Br + tx;
+            if (idx < Bc * d) {
+                kj[idx] = K[(j * Bc) * d + idx];
+                vj[idx] = V[(j * Bc) * d + idx];
+            }
         }
         __syncthreads();
 
+        // Compute Sij tile and find row max mij
         float mij = -FLT_MAX;
-        for (int col = 0; col < Bc; col++) {
-            float sum = 0;
-            for (int k = 0; k < d; k++) {
-                sum += qi[tx * d + k] * kj[col * d + k];
+        for (int c = 0; c < Bc; c++) {
+            float sum = 0.0f;
+            for (int n = 0; n < d; n++) {
+                sum += qi[tx * d + n] * kj[c * d + n];
             }
-            sum *= softmax_scale;
-            Sij[tx * Bc + col] = sum;
+            sum *= scale;
+            Sij[tx * Bc + c] = sum;
             if (sum > mij) mij = sum;
         }
 
+        // Online Softmax rescaling factors
         float mi_new = fmaxf(mi, mij);
-        float p_scale = expf(mi - mi_new);
-        float p_curr_scale = expf(mij - mi_new);
-
+        float alpha = expf(mi - mi_new);
+        
         float lij = 0.0f;
-        for (int col = 0; col < Bc; col++) {
-            float p = expf(Sij[tx * Bc + col] - mi_new);
-            Sij[tx * Bc + col] = p; 
+        for (int c = 0; c < Bc; c++) {
+            float p = expf(Sij[tx * Bc + c] - mi_new);
+            Sij[tx * Bc + c] = p; // P_ij_hat
             lij += p;
         }
 
-        for (int k = 0; k < d; k++) {
-            float pv = 0;
-            for (int col = 0; col < Bc; col++) {
-                pv += Sij[tx * Bc + col] * vj[col * d + k];
+        // Update local output row: Oi = alpha * Oi + Pij * Vj
+        for (int n = 0; n < d; n++) {
+            float pv = 0.0f;
+            for (int c = 0; c < Bc; c++) {
+                pv += Sij[tx * Bc + c] * vj[c * d + n];
             }
-            oi[k] = oi[k] * p_scale + pv * p_curr_scale; 
+            local_oi[n] = local_oi[n] * alpha + pv;
         }
-        li = li * p_scale + lij;
+
+        // Update running statistics
+        li = li * alpha + lij;
         mi = mi_new;
         __syncthreads();
     }
 
-    for(int k=0; k<d; k++) {
-        O[(i * Br + tx) * d + k] = oi[k] / li;
+    // Final normalization and write-back to Global Memory
+    for (int n = 0; n < d; n++) {
+        O[(i * Br + tx) * d + n] = local_oi[n] / li;
     }
-    L[i * Br + tx] = mi + logf(li);
 }
 
-torch::Tensor flash_attn_fwd(torch::Tensor Q, torch::Tensor K, torch::Tensor V, int Br, int Bc) {
+// PyTorch binding
+torch::Tensor forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V, int Br, int Bc) {
     int N = Q.size(0);
     int d = Q.size(1);
     auto O = torch::zeros_like(Q);
-    auto L = torch::zeros({N}, Q.options());
-    float scale = 1.0 / sqrt(d);
+    float scale = 1.0f / sqrtf((float)d);
 
-    int sram_size = (Br * d + 2 * Bc * d + Br * Bc) * sizeof(float);
+    // Dynamic Shared Memory size based on assignment formula
+    size_t sram_size = (Br * d + 2 * Bc * d + Br * Bc) * sizeof(float);
     
-    const int threads = Br;
-    const int blocks = (N + Br - 1) / Br;
+    dim3 grid(N / Br);
+    dim3 block(Br);
 
-    flash_attn_v2_fwd_kernel<<<blocks, threads, sram_size>>>(
+    flash_attn_v2_kernel<<<grid, block, sram_size>>>(
         Q.data_ptr<float>(), K.data_ptr<float>(), V.data_ptr<float>(),
-        O.data_ptr<float>(), L.data_ptr<float>(),
-        N, d, Br, Bc, scale
+        O.data_ptr<float>(), N, d, Br, Bc, scale
     );
     return O;
 }
 
-
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("forward", &flash_attn_fwd, "FlashAttention forward");
+    m.def("forward", &forward, "FlashAttention V2 Forward Implementation");
 }
-"""
-
-with open("flash_attn.cu", "w") as f:
-    f.write(cuda_code)
-
-print(" CUDA Kernel ( 30-60 seconds)...")
-flash_attn_lib = load(
-    name="flash_attn_lib",
-    sources=["flash_attn.cu"],
-    verbose=True
-)
-
-
-N, d = 512, 64 
-Br, Bc = 32, 32
-Q, K, V = [torch.randn(N, d, device="cuda") for _ in range(3)]
-
-
-output_custom = flash_attn_lib.forward(Q, K, V, Br, Bc)
-
-output_ref = torch.nn.functional.scaled_dot_product_attention(
-    Q.unsqueeze(0), K.unsqueeze(0), V.unsqueeze(0)
-).squeeze(0)
-
-
-diff = torch.abs(output_custom - output_ref).max().item()
-print(f"\\n: {diff:.6e}")
-if diff < 1e-4:
-    print("✅ Result Match！")
-else:
-    print("❌ Discrepancy detected; suggest checking the scaling logic")
